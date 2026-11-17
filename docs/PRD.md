@@ -107,18 +107,17 @@ Session and visit identifiers are deliberately **not** linking inputs — they s
 
 ## Success Metrics
 
-| Category | Metric | Why it matters |
-|---|---|---|
-| Identity quality | Where we *know* two sessions were the same person (they later logged into the same account on both), how often did we group them correctly before the login revealed it? | Our accuracy check. Logged-in users give us a correct answer to grade against. |
-| Identity quality | How often we wrongly group unrelated people — e.g. two people sharing a family laptop and browser profile | The dangerous failure. A wrong merge makes one "identity" look like it holds many identifiers, which is exactly the bot pattern. **A false merge can manufacture a false bot flag.** |
-| Identity quality | Share of web sessions that link to an account at all | Tells us how much of the web population we can resolve at all. If low, our web identity coverage is thin and the bot signals must carry correspondingly more weight. |
-| Bot detection quality | Share of total sessions flagged, tracked over time | Confirms we're finding a meaningful, stable volume rather than noise. A sudden swing means either an attack or a broken threshold. |
-| Bot detection quality | How often we wrongly flag legitimate heavy users — travel agents, affiliate partners | These genuinely browse fast and in volume, so they trip the same signals as bots. Keeping this low is what makes the output safe to act on. |
-| Business impact | Estimated ad spend tied to clicks we flagged as bots | The direct answer to problem 1, in dollars. |
-| Business impact | Share of search and pricing traffic attributed to scrapers | The direct answer to problem 2, and it tells the platform team how much capacity serves bots. |
-| Speed | Time from an event arriving to its identity and score being available downstream | The signal is only useful if it lands before the click is credited or the scrape completes. |
-| Reliability | Zero duplicated or lost output records when a processing node is killed mid-stream | Verified by deliberately killing worker processes while data flows, then checking the output is still exactly right. These numbers feed money decisions, so "mostly correct" isn't good enough. |
-| Reliability | Stored state size staying flat over time rather than growing | Confirms unused entries really are expiring. Unbounded growth eventually takes the job down. |
+Three metrics, chosen because each can be computed from data we already have — **none require anyone to hand-label traffic as bot or human**, which is what usually makes bot-detection metrics unmeasurable in practice. The tech design specifies how each is calculated.
+
+| # | Metric | Target | Why this one |
+|---|---|---|---|
+| 1 | **Are we flagging real customers?** Booking rate of flagged traffic, as a share of the overall booking rate. | Flagged traffic books at under 5% of baseline | Real travelers book; bots essentially never do. If flagged traffic books at anywhere near the normal rate, we're flagging humans — and the whole output becomes unsafe to act on. This is the metric that protects customers. |
+| 2 | **Are we catching bots at all?** Share of traffic from known datacenter networks that we independently flag. | Above 90% | Nobody browses for a holiday from a cloud datacenter, so that traffic is a free labelled sample of near-certain bots. Crucially, no datacenter signal feeds our scoring, so this is a genuinely independent check rather than a circular one. |
+| 3 | **Is this worth running?** Ad spend tied to flagged clicks, and share of search and pricing traffic from flagged identities. | Reported monthly; no target in v1 | The dollar answer to problem 1 and the load answer to problem 2. v1 measures the size of the problem rather than committing to reducing it, since v1 doesn't act on the signal. |
+
+**What metric 2 does not cover:** sophisticated bots renting residential IP addresses look like ordinary home traffic and never appear in the datacenter sample. So metric 2 measures recall against the *easy* subset only — it's a floor, not the true catch rate. Worth being honest about rather than quoting it as overall accuracy.
+
+Supporting diagnostics — false-merge rate, latency, state growth, and exactly-once validation — are tracked as engineering guardrails rather than product metrics, and are specified in the tech design.
 
 ## Open Questions
 

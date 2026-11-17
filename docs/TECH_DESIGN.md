@@ -204,6 +204,66 @@ We publish one thing: a stream of identities that look automated, with the ident
 
 **Why `member_ids` is on the record.** Without it, every consumer would have to maintain a stateful join back to raw clickstream to work out which events belonged to a flagged identity — the same cost paid four times, with four chances to get it wrong. Shipping the identifier set makes the stream self-contained: a consumer joins a small set of flagged IDs against its own data, which is cheap, instead of joining against the firehose.
 
+## Measuring Success
+
+The three product metrics each need a concrete implementation, or they stay aspirational. All three run as scheduled batch jobs over the warehouse, not inside the streaming job — they're analytical questions over a period, and keeping them out of the hot path means a metric change never risks the pipeline.
+
+**Prerequisite:** the bot signal stream is sunk from Kafka into a warehouse table partitioned by date. Every metric below is SQL over that table joined to existing clickstream and campaign data. No new collection.
+
+### Metric 1 — Booking rate of flagged traffic (precision)
+
+| | |
+|---|---|
+| **Question** | Are we flagging people who actually book? |
+| **Inputs** | `member_ids` from the signal table; booking events from clickstream |
+| **How** | For the day's flagged identities, unnest `member_ids` and left-join to booking events on the same identifiers over the same window. Compute bookings-per-identifier for the flagged set, and the same figure site-wide as a baseline. Report the ratio. |
+| **Reads as** | Flagged-cohort booking rate ÷ baseline booking rate. Near zero is healthy; approaching 1.0 means we're flagging customers. |
+| **Watch out** | It never reaches exactly zero — some bot activity is card-testing and fraudulent booking, which does convert. A *rise* in this ratio is the alarm, not its absolute value. |
+
+### Metric 2 — Recall against datacenter traffic
+
+| | |
+|---|---|
+| **Question** | Of traffic that is almost certainly automated, how much do we catch? |
+| **Inputs** | A reference table of cloud-provider network ranges, refreshed on a schedule from published provider ranges; the signal table |
+| **How** | Label clickstream events whose IP address falls in those ranges. Group to identities. Compute the share of those identities that the pipeline independently flagged above threshold. |
+| **Reads as** | A percentage. Below target means our thresholds are too conservative or a signal has regressed. |
+| **Why it stays honest** | **No scoring signal uses network ownership.** Fan-out, shared IP, churn, and timing are all behavioural. Keep it that way — the moment datacenter membership becomes a scoring input, this metric starts grading its own homework and must be retired. |
+| **Watch out** | Residential-proxy bots never appear here, so this is recall on the easy subset. Report it labelled as such. |
+
+### Metric 3 — Business impact
+
+| | |
+|---|---|
+| **Question** | How much money and load does bot traffic account for? |
+| **Inputs** | Signal table; paid-click events with campaign cost; search and pricing request logs |
+| **How** | Join flagged `member_ids` to paid clicks, sum the associated spend, break out by campaign. Separately, compute the share of search and pricing requests attributable to flagged identities, broken out by endpoint. |
+| **Reads as** | A monthly dollar figure for marketing and a percentage-of-load figure for the platform team. |
+| **Watch out** | This is an estimate bounded by metric 2 — we can only count the bots we caught, so it understates the real total. Present it as a floor. |
+
+## Diagnostics & Guardrails
+
+Not product metrics — these exist to explain *why* the three metrics above moved, and to catch the pipeline breaking silently.
+
+| Guardrail | How it's measured | Why it matters |
+|---|---|---|
+| **False-merge rate** | Share of identity clusters containing more than one distinct account ID | The main cause of metric 1 degrading. Two accounts in one cluster usually means two people were merged — which inflates fan-out and can manufacture a bot flag. (Shared household accounts create some legitimate noise here, so track the trend rather than the absolute.) |
+| **Account linkage coverage** | Share of web sessions that ever link to an account | Tells us how much identity resolution is even possible on web. If this is low, the behavioural signals are carrying nearly all the weight, and metric 2 should be read with that in mind. |
+| **End-to-end latency** | Event timestamp → signal record published, at p50 and p99 | The signal has to arrive before a consumer can use it. Watermark lag is the usual cause of regression here. |
+| **State size per worker** | RocksDB size over time, from Flink metrics | Should be flat once traffic stabilises. Sustained growth means expiry isn't working and the job will eventually fail. |
+| **Exactly-once validation** | Chaos test, run before each release — see below | Correctness under failure is a claim that needs re-proving when the job changes. |
+
+### Exactly-once validation procedure
+
+Run against a staging job with a known, replayable input set:
+
+1. Publish a fixed, counted set of events to the input topic.
+2. While the job is consuming, kill a TaskManager process.
+3. Let the job recover from its last checkpoint and drain.
+4. Compare output to expectation on two counts: **no duplicates** (group the output by identity and window, assert one record each) and **nothing lost** (every input identity that should have scored is present).
+
+Both assertions must pass. A duplicate means the Kafka sink isn't transactional; a gap means output was emitted but not covered by a checkpoint.
+
 ## How Failure Is Handled
 
 - **State lives in RocksDB** on disk, so the identity graph isn't bounded by memory. Checkpoints are incremental — each saves only what changed.

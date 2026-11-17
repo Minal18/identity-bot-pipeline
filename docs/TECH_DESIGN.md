@@ -2,122 +2,230 @@
 
 ## The One-Paragraph Version
 
-A Flink job reads clickstream events from Kafka. The first stage groups device, cookie, and account IDs that appear together into one identity. The second stage looks at each identity over a time window and scores how bot-like it behaves. The result goes back out to Kafka for other teams. The whole thing is built so that if a machine dies mid-stream, we don't lose or double-count anything.
+A Flink job reads clickstream events from Kafka. Stage one groups identifiers that appear together into a single identity. Stage two looks at each identity over a time window and scores how bot-like it behaves. Results go back to Kafka in two shapes — an enriched event stream and a per-identity verdict table — for other teams to consume. The whole thing is built so that if a machine dies mid-stream, nothing is lost or double-counted.
 
-> The design choices below (how we partition the data, exact field names, window sizes) are written as decisions to confirm against the running job — flag anything that doesn't match what was actually built.
+> Design decisions below (partitioning, field names, window sizes) are written to be confirmed against the running job — flag anything that doesn't match what was actually built.
 
 ## Key Terms
 
 | Term | What it means |
 |---|---|
-| Flink | The stream processing engine this job runs on. Processes events one at a time as they arrive, rather than in nightly batches. |
-| Kafka | The message queue events flow through — one topic in, one topic out. |
-| Operator | One processing step inside the Flink job. Our job has two main ones: identity resolution, then bot scoring. |
-| Keyed state | Memory the job keeps per key — here, per identity. When an event for identity X arrives, Flink gives the operator exactly X's stored data to read and update. |
-| RocksDB | An on-disk key-value store Flink can use to hold that state, so it can be larger than available memory. |
-| TaskManager | A Flink worker process. A job runs across several; killing one is how we test failure recovery. |
-| Checkpoint | A periodic saved snapshot of everything the job has in state. On a crash, the job restarts from the last one. |
-| Exactly-once | The guarantee that each input event affects the output exactly one time, even across a crash and restart. Not "at least once" (duplicates) and not "at most once" (data loss). |
-| Event time | Ordering by when something actually happened, not when it reached us. |
-| Watermark | A marker flowing through the stream meaning "we believe we've now seen all events up to time T." It's how the job decides a time window is complete and safe to emit. |
-| Union-find | An algorithm for merging groups. Each group has one member designated as its representative; merging two groups means pointing one representative at the other. Checking "are these two IDs in the same group?" means following the pointers up to the representative for each. |
-| Fan-out | How many distinct IDs have merged into one identity. The core bot signal — a bot farm accumulates far more than a real person. |
+| Flink | The stream processing engine this runs on. Handles events as they arrive rather than in nightly batches. |
+| Kafka | The message queue events flow through — topics in, topics out. |
+| Operator | One processing step inside the job. Ours has two: identity resolution, then bot scoring. |
+| Keyed state | Memory the job keeps per key — here, per identity. When an event for identity X arrives, Flink hands the operator exactly X's stored data to read and update. |
+| RocksDB | An on-disk key-value store Flink can use for that state, so it can exceed available memory. |
+| TaskManager | A Flink worker process. A job spans several; killing one is how we test recovery. |
+| Checkpoint | A periodic snapshot of all job state. After a crash, the job restarts from the last one. |
+| Exactly-once | Each input event affects the output exactly one time, even across a crash. Not "at least once" (duplicates), not "at most once" (loss). |
+| Event time | Ordering by when something happened, not when it reached us. |
+| Watermark | A marker flowing through the stream meaning "we believe we've seen everything up to time T." It tells the job when a window is complete and safe to emit. |
+| Union-find | An algorithm for merging groups. Each group has one member designated its representative; merging points one representative at the other. Asking "are these two in the same group?" means following pointers up to each one's representative. |
+| Compacted topic | A Kafka topic that keeps only the most recent record per key — effectively a lookup table, not a history. |
+
+## The Identifiers We Work With
+
+This drives every design decision downstream, so it comes first.
+
+| Identifier | Backed by | Scope | Survives a browser-data clear? |
+|---|---|---|---|
+| **Browser ID** | A long-lived cookie, typically years, often stored redundantly across paired cookies so a partial clear regenerates it | One browser | Only partially — a deliberate full clear resets it |
+| **App device ID** | Operating-system device identifier, no cookies involved | One device, **app traffic only** | Yes, entirely unaffected |
+| **Account ID** | Login | One person | Yes |
+| Session / visit ID | Short-lived cookie or inactivity window | A slice of one browser's activity | No |
+
+**The critical point: on web there is no hardware identifier.** Clickstream schemas commonly label the long-lived browser cookie a "device ID," but it identifies a browser, not a machine. Two browsers on one laptop yield two of them. This means on web, "browser ID" and "device ID" are *one signal, not two* — and treating them as independent corroboration would be double-counting.
+
+### What this implies
+
+**Only these merges carry information:**
+
+| Merge edge | Fires on | Value |
+|---|---|---|
+| Browser ID ↔ account ID | Web login | The only way to join two browsers to one person |
+| App device ID ↔ account ID | App login | Joins app activity to the person |
+| **App device ID ↔ browser ID** | **App webview — both on one event** | Bridges app and web identity. The highest-value edge we get. |
+
+**Session and visit IDs are excluded from union-find on purpose.** They subdivide one browser's activity rather than connecting distinct identifiers, so they'd add state and noise without adding linking evidence. They're used instead as denominators for the timing signal.
+
+**IP address is deliberately not a merge key either** — see Example C.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    A["Clickstream Events<br/>(Kafka input topic)<br/>device_id, cookie_id, account_id, ip, timestamp"] --> B["Stage 1: Identity Resolution<br/>(union-find over keyed state)"]
+    A["Clickstream Events<br/>(Kafka input topic)<br/>browser_id, app_device_id, account_id, ip, timestamp"] --> B["Stage 1: Identity Resolution<br/>(union-find over keyed state)"]
     B -- "read/update identity groups" --> C[("Keyed State<br/>RocksDB, entries auto-expire")]
-    B --> D["Stage 2: Bot Scoring<br/>(time windows, ordered by event time)"]
-    D -- "fan-out · shared IP · click timing" --> D
+    B --> D["Stage 2: Bot Scoring<br/>(event-time windows)"]
+    D -- "fan-out · shared IP · ID churn · timing" --> D
     B -. "periodic snapshot" .-> E[("Checkpoints<br/>for exactly-once recovery")]
     D -. "periodic snapshot" .-> E
-    D --> F["Kafka Output Topic<br/>identity_id + bot_score + reasons"]
-    F --> G["Attribution Pipeline"]
-    F --> H["Fraud / Trust & Safety Alerts"]
-    F --> I["Search & Pricing Rate Limiter (future)"]
-    F --> J["Analytics & Reporting"]
+    D --> F["Enriched Event Stream<br/>(full event + identity + score)"]
+    D --> G["Verdict Table<br/>(compacted, keyed by identity / IP)"]
+    F --> H["Attribution Pipeline"]
+    F --> I["Analytics & Reporting"]
+    G --> J["Fraud / Trust & Safety"]
+    G --> K["Rate Limiter (future)"]
 ```
 
 ## How It Works, Step by Step
 
-**Stage 1 — Identity Resolution.** Runs on every single event.
+### Stage 1 — Identity Resolution (runs on every event)
 
-An event might carry a device ID, a cookie ID, and sometimes an account ID. The fact that they arrived on the *same event* is the evidence that they belong to the same person. So the operator looks up what group each of those IDs currently belongs to, and if they're in different groups, it merges them into one. Then it tags the event with the identity it now belongs to and passes it along.
+An event may carry a browser ID, sometimes an app device ID, sometimes an account ID. The fact that they arrived on the *same event* is the evidence they belong to one person. The operator looks up which group each currently belongs to; if they're in different groups, it merges them. Then it tags the event with the resulting identity and passes it on.
 
-The merging is permanent and incremental — we never recompute the whole graph, we just keep absorbing new evidence as it arrives. That's what makes it work in real time.
+Merging is permanent and incremental — we never recompute the graph, we absorb evidence as it arrives. That's what makes it real-time.
 
-**Stage 2 — Bot Scoring.** Runs on time windows, not individual events.
+### Stage 2 — Bot Scoring (runs on time windows)
 
-Scoring needs to look at behavior over a period, not one click, so this stage collects events per identity over a window and then computes three things:
+Scoring needs behaviour over a period, not a single click, so this stage accumulates events per identity over a window, then computes:
 
-- **Fan-out** — how many new device and cookie IDs joined this identity during the window. A real traveler adds devices rarely. A bot farm adds them constantly.
-- **Shared IP address** — how many *separate* identities were seen on the same IP address. Note this one is computed per IP address rather than per identity, then attached back to each identity that used that address. That's deliberate: it catches bot farms whose fake identities haven't been merged together yet, because they were careful not to let their IDs co-occur on a single event.
-- **Click timing** — the gaps between consecutive events. Humans are irregular; they pause, they get distracted. Scripts produce intervals that are either too fast to be physically possible or suspiciously evenly spaced.
+- **Fan-out** — how many new identifiers joined this identity during the window. Strong on app traffic. **Weak on web**, for reasons Example B makes concrete.
+- **Shared IP address** — how many *separate* identities appeared on one IP address. Computed per address and then attached back to each identity that used it. Deliberate: it catches bot farms whose identities never merged, because they never let identifiers co-occur on a single event.
+- **New-identifier churn per IP address** — how many brand-new browser IDs first appear from one address per minute. This is the counter to cookie-rotating bots and the main thing that still works when fan-out fails.
+- **Click timing** — gaps between consecutive events. Humans pause and get distracted; scripts produce intervals either too fast to be physical or suspiciously regular.
 
-These combine into one score, published along with the individual signal values so each consuming team can set its own threshold instead of trusting our blended number.
+These combine into one score, published alongside the individual values so each team can set its own threshold rather than trusting our blend.
 
-**Why event time and watermarks matter here.** The three signals don't arrive together or in order. Account ID in particular usually shows up at checkout — long after the device and cookie events from the same session. If we scored by arrival time, we'd finalize a window before the evidence that changes the answer had arrived. Processing by event time with watermarks lets the job wait an appropriate amount before declaring a window complete.
+**Why event time and watermarks matter here.** The signals don't arrive together or in order. Account ID in particular shows up at checkout, long after the browsing events it retroactively explains. Scoring by arrival time would finalize windows before the evidence that changes the answer had landed. Event time plus watermarks lets the job wait appropriately before declaring a window done.
+
+## Worked Examples
+
+### Example A — a real traveler
+
+| Time | Event carries | Groups afterwards |
+|---|---|---|
+| Mon 9am | `B1` (laptop Chrome) | `{B1}` |
+| Mon 8pm | `B2` (phone browser) | `{B1}`, `{B2}` — still two identities |
+| Tue 8pm | `B2`, **`A1`** (logs in on phone) | `{B1}`, `{B2, A1}` |
+| Wed 9am | `B1`, **`A1`** (logs in on laptop) | **`{B1, B2, A1}`** — merged |
+
+The merge happens Wednesday because `A1` is already in one group while `B1` is in another, and one event touches both. Until then, treating them as two visitors was *correct given the evidence available*. Three identifiers over three days is unremarkable — no bot signal.
+
+### Example B — a cookie-rotating scraper
+
+A bot clearing browser data between requests. With a true device identifier present (app traffic):
+
+```
+B10 + DeviceX → {B10, DeviceX}
+B11 + DeviceX → {B10, B11, DeviceX}      ← DeviceX anchors everything
+B12 + DeviceX → {B10, B11, B12, DeviceX}
+... 200 browser IDs in 5 min              → fan-out = 200 → clearly a bot
+```
+
+On **web**, where the only durable identifier is itself a cookie:
+
+```
+B10 → {B10}
+B11 → {B11}      ← nothing ever merges
+B12 → {B12}
+```
+
+200 separate identities, each with a fan-out of 1. **The fan-out signal reports "perfectly normal" two hundred times.** This is the single most important limitation of the design to understand and be able to state.
+
+What catches it instead: 200 distinct identities on one IP address within 5 minutes, 200 brand-new browser IDs minted from that address in the same window, and mechanically even click spacing. Those three are why the scoring stage doesn't depend on linking having succeeded.
+
+### Example C — why IP address is never a merge key
+
+Two colleagues on one corporate network share an IP but never share a browser, device, or account. They remain separate identities — correct. Had we merged on IP address, we'd fuse an entire office building into one identity with enormous fan-out and flag it as a bot farm. IP address is a **scoring signal only**.
 
 ## Components
 
 | Component | What it does |
 |---|---|
-| **Kafka input topic** | Raw clickstream events: device ID, cookie ID, account ID (empty until someone logs in), IP address, event type, and when it happened |
-| **Identity Resolution operator** | Merges IDs that appear together into one identity; tags each event with its current identity |
-| **Keyed state (RocksDB)** | Holds the identity groups. RocksDB rather than memory because at production traffic the graph is bigger than the job's available memory |
-| **Automatic expiration** | Any link not seen again within a set time window is dropped, so one-off and long-dormant visitors don't pile up forever |
-| **Bot Scoring operator** | Computes the three signals over time windows and combines them into a score |
-| **Checkpointing** | Periodically snapshots all state; combined with Kafka's transactional writes, this is what makes the exactly-once guarantee hold through a crash |
-| **Kafka output topic** | Identity ID, bot score, the individual signal values, and the original event's reference fields |
-| **Downstream consumers** | Attribution (drop or flag bot clicks), fraud team (alerts), platform team (rate limiting, future), analytics and reporting |
+| **Kafka input topic** | Raw clickstream events: browser ID, app device ID (app traffic only), account ID (after login only), IP address, event type, event timestamp |
+| **Identity Resolution operator** | Merges identifiers appearing together; tags each event with its current identity |
+| **Keyed state (RocksDB)** | Holds the identity groups. On-disk rather than in-memory because at production volume the graph exceeds the job's available memory |
+| **Automatic expiration** | Links not seen again within a set window are dropped, so one-off and dormant visitors don't accumulate forever |
+| **Bot Scoring operator** | Computes the four signals over event-time windows and combines them |
+| **Checkpointing** | Snapshots all state periodically; combined with Kafka transactional writes, this is what makes exactly-once hold through a crash |
+| **Enriched event stream** | Full original event plus identity and score — so consumers never need to join back to raw clickstream |
+| **Verdict table** | Compacted topics keyed by identity and by IP address, holding only the current verdict — the lookup path |
 
 ## Data Model
 
-### Identity group state (one per identity)
+**Internal vs. external matters here:**
+
+| Model | Lives in | Visibility |
+|---|---|---|
+| Identity group state | Flink keyed state (RocksDB) | **Internal only.** Never leaves the job. Exists so the next event can be merged. Freely changeable. |
+| Bot scoring window state | Flink window state | **Internal only.** Scratch space for one window, discarded when it closes. |
+| Enriched event + verdict record | Kafka output topics | **The public contract.** The only things other teams ever see, and the only ones needing careful versioning. |
+
+### Identity group state (internal — one per identity)
 
 | Field | Type | Notes |
 |---|---|---|
-| `cluster_root_id` | string | The ID chosen to represent this group — how union-find identifies the group |
-| `member_ids` | set of strings | Every device, cookie, and account ID merged into this identity |
-| `last_seen_at` | timestamp | Refreshed on every event; this is what the expiration clock reads |
+| `cluster_root_id` | string | The member chosen to represent this group — how union-find names it |
+| `member_ids` | set of strings | Every browser, app device, and account identifier merged into this identity |
+| `last_seen_at` | timestamp | Refreshed on every event; the expiration clock reads this |
 | `first_seen_at` | timestamp | Used to measure how fast the identity grew |
 
-### Bot scoring window state (one per identity, per window)
+**How `cluster_root_id` is chosen.** It is **one of the real member identifiers**, not a generated value — standard union-find, where merging two groups makes one group's representative the parent of the other's (normally attaching the smaller group to the larger).
+
+Two consequences worth knowing:
+
+- **It changes over time.** In Example A the identity is `B1` on Monday and may become `A1` on Wednesday. This is the mechanism behind the "identity isn't stable" caveat below.
+- **Choose it deterministically for replay safety.** If the representative is picked arbitrarily, a job replaying from a checkpoint could select a different one and emit different identity IDs for identical input — quietly undermining the exactly-once claim. Picking deterministically (for instance, the lexicographically smallest member) makes replay reproduce identical output.
+
+A production-grade alternative is a **synthetic generated identity plus a published alias table**: when one group absorbs another, emit an "old identity → new identity" record so consumers can follow merges. Costs extra state; saves every downstream team from handling it themselves.
+
+### Bot scoring window state (internal — one per identity, per window)
 
 | Field | Type | Notes |
 |---|---|---|
-| `distinct_member_count_in_window` | int | The fan-out signal — how many new IDs joined during this window |
-| `distinct_identities_per_ip` | int | The shared-IP-address signal — computed per address, then attached to each identity on it |
-| `inter_arrival_stats` | average, standard deviation, minimum | The click-timing signal. Low standard deviation means mechanically even spacing; a very low minimum means faster than a human could click |
-| `bot_score` | float | The three signals combined |
+| `distinct_member_count_in_window` | int | Fan-out — new identifiers joined this window |
+| `distinct_identities_per_ip` | int | Shared-IP signal — computed per address, attached to each identity on it |
+| `new_ids_minted_per_ip` | int | Churn signal — brand-new browser IDs first seen from this address this window |
+| `inter_arrival_stats` | mean, standard deviation, minimum | Timing signal. Low standard deviation means mechanical spacing; a very low minimum means faster than a human can click |
+| `bot_score` | float | The four signals combined |
 
-### Output record
+### Enriched event record (public)
+
+The full original event, plus:
 
 | Field | Type | Notes |
 |---|---|---|
-| `event_id` | string | Links back to the original event |
-| `identity_id` | string | The identity as of right now — this can change later if the group merges again (see below) |
-| `bot_score` | float | A 0–1 likelihood, not a yes/no verdict |
-| `signal_breakdown` | fan-out, shared IP, timing | The individual values behind the score, so consumers can apply their own thresholds |
-| `watermark_at_emission` | timestamp | Tells a consumer how much late data could still arrive and change this score |
+| `identity_id` | string | The group representative **at emission time** — may change later if the group merges again |
+| `bot_score` | float | 0–1 likelihood, not a yes/no verdict |
+| `signal_breakdown` | fan-out, shared IP, churn, timing | The individual values, so consumers apply their own thresholds |
+| `watermark_at_emission` | timestamp | Tells a consumer how much late data could still revise this |
+
+### Verdict record (public, compacted — keyed by `identity_id`, and separately by IP address)
+
+| Field | Type | Notes |
+|---|---|---|
+| `bot_score` | float | Current score for this identity or address |
+| `signal_breakdown` | struct | As above |
+| `updated_at` | timestamp | When this verdict was last revised |
+
+## How Downstream Teams Actually Consume This
+
+**The timing reality first:** the bot score necessarily lags the event, because scoring needs a window to close. **No consumer can synchronously filter the event that produced the signal.** You either filter *subsequent* traffic or filter *retroactively*. There is no third option — and that's fine, because it maps cleanly onto the two consumer shapes:
+
+**Shape 1 — retroactive (attribution, analytics).** These reconcile hours or days later anyway, so lag is irrelevant. They read the **enriched event stream** and filter on `bot_score`, or land it in the warehouse and filter there. No join required, because the enriched stream already carries the full event.
+
+**Shape 2 — forward-looking (fraud alerting, rate limiting).** These can't un-serve the request that triggered the score, and don't need to — they need to act on the *next* requests from that identity or address. They read the **compacted verdict table** as a lookup: "is this identity currently flagged?"
+
+**Why not have consumers join against the raw stream?** Because publishing only an event reference would force **every** consumer to maintain a stateful join back to raw clickstream to recover what the event was — four teams each paying the same cost, four chances to get it wrong. Emitting the enriched event once moves that cost into this job, where it's paid a single time.
 
 ## How Failure Is Handled
 
-- **State lives in RocksDB**, on disk, so the identity graph isn't limited by memory. Checkpoints are incremental — each one saves only what changed, not a full copy.
-- **Exactly-once comes from two things working together**: Flink's checkpoints (a consistent snapshot of all state at a moment in time) and Kafka's transactional writes (output stays invisible to consumers until the checkpoint that produced it is confirmed). Without the second half, a crash between writing output and saving the checkpoint would produce duplicates on replay.
+- **State lives in RocksDB** on disk, so the identity graph isn't bounded by memory. Checkpoints are incremental — each saves only what changed.
+- **Exactly-once comes from two mechanisms together**: Flink checkpoints (a consistent point-in-time snapshot of all state) and Kafka transactional writes (output stays invisible until the checkpoint that produced it is confirmed). Without the second, a crash between emitting output and saving the checkpoint would produce duplicates on replay.
 - **State stays bounded** because unused links expire, so storage tracks active traffic rather than all traffic ever seen.
-- **This was tested, not assumed.** We killed TaskManagers while data was flowing and confirmed the output topic had no duplicated and no missing records afterward — the guarantee holds under a real crash, not just on paper.
+- **This was tested, not assumed.** TaskManagers were killed while data flowed, and the output topic was verified afterwards to contain no duplicated and no missing records — the guarantee holds under a genuine crash, not just on paper.
 
 ## Known Trade-offs & Open Items
 
-- **Merging across partitions is the hard part.** Flink splits state across workers by key. If device IDs and account IDs get routed to different workers, then discovering that two *already-existing* groups on *different workers* should merge is not something one worker can do alone — it needs either a broadcast of recent state or an explicit merge message sent to both. Worth confirming how the running job handles this, because if groups can silently exist in two places, the fan-out count is wrong.
+- **Fan-out is weak on web, by construction.** Because the durable web identifier is itself cookie-backed, a bot clearing browser data between requests never merges into a cluster, and fan-out reads as normal (Example B). The shared-IP and churn-per-IP signals exist specifically to cover this. Worth stating plainly rather than letting fan-out appear to do more work than it can.
 
-- **The identity ID isn't stable forever.** We emit the identity as it stands at that moment. Later evidence can merge that group into a bigger one — for example, a returning visitor's old cookie finally links to their account at checkout, long after earlier events were already scored and published under a different ID. Any consumer that needs a stable key over time (attribution reconciliation especially) needs a way to remap old IDs, not just the one we gave them at the time.
+- **Merging across partitions is the hard part.** Flink splits state across workers by key. If browser IDs and account IDs route to different workers, discovering that two *already-existing* groups on *different workers* should merge isn't something one worker can do alone — it needs either a broadcast of recent state or an explicit merge message routed to both. Worth confirming how the running job handles this: if groups can silently exist in two places, every fan-out count is wrong.
 
-- **Expiration conflicts with genuinely infrequent visitors.** Someone who returns after their links have expired looks like a brand-new identity. That's fine for storage, but it means a legitimate once-a-year traveler reappears as a "new" identity rapidly picking up devices — which is the fan-out pattern we treat as a bot signal. Needs validating against real low-frequency users so expiration doesn't manufacture false positives.
+- **The identity ID isn't stable forever.** We emit the representative as it stands. Later evidence can merge that group into a larger one — a returning visitor's browser finally linking to their account at checkout, long after earlier events were scored under a different ID. Consumers needing a stable key over time (attribution reconciliation especially) need either the alias table described above or a remap step.
 
-- **Click timing is weak on its own.** Someone with saved payment details and autofill clicks through fast and regularly. So does a travel agent doing this all day. That's exactly why it's one of three signals rather than a standalone rule — but how much weight each signal gets has to be tuned on real traffic, not guessed up front.
+- **Two different expiry clocks, often confused.** The browser identifier itself lives for years in the browser; our Flink state may expire a link after weeks. A visitor returning after our state expired still presents the *same* browser ID, so re-linking is cheap and fast — this makes the returning-visitor concern much milder than it first appears. The risk isn't losing the identifier, it's losing the *account association* we'd previously established, which then has to be re-earned at the next login.
 
-- **Account ID usually arrives late.** Because it only appears at login or checkout, we may publish a score before the single most informative signal has arrived. Watermark lag needs monitoring, and consumers acting on a score should know how settled it is — the `watermark_at_emission` field exists for exactly that.
+- **Click timing is weak alone.** Someone with saved payment details and autofill clicks fast and regularly; so does a travel agent working all day. That's exactly why it's one of four signals rather than a standalone rule — but the weighting has to be tuned on real traffic, not guessed up front.
+
+- **Account ID arrives late.** It only appears at login or checkout, so we often publish a score before the most informative signal has landed. Watermark lag needs monitoring, and consumers acting on a score should know how settled it is — `watermark_at_emission` exists for exactly that.

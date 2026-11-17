@@ -72,6 +72,28 @@ An event may carry a browser ID, sometimes an app device ID, sometimes an accoun
 
 Merging is permanent and incremental — we never recompute the graph, we absorb evidence as it arrives. That's what makes it real-time.
 
+#### Why union-find is implemented here rather than taken from a library
+
+Textbook union-find assumes one process, one in-memory parent array, and random access to any element. All three are false in a partitioned streaming job:
+
+| Textbook assumption | Reality here |
+|---|---|
+| Global access to the parent map | A keyed function can read only **its own key's** state — there is no way to call `find(x)` from inside key `y` |
+| An in-memory object graph | State must live in Flink managed state to be checkpointed; a plain in-memory structure is lost on restart |
+| Path compression rewrites many entries per lookup | Writing to another key's state isn't possible, so classic path compression can't be performed |
+
+A library implementation would appear to work in a single-node test and then lose the entire identity graph on the first recovery. So the structure is implemented directly against keyed state:
+
+```java
+ValueState<String>        root;      // the identifier I currently point at
+MapState<String, Boolean> members;   // populated only when I am the root
+ValueState<Long>          lastSeen;  // drives expiry
+```
+
+Keyed by identifier, merging becomes message passing rather than a function call. An event carrying two identifiers fans out into link requests; one side reads its root and sends a merge message toward the other; the receiving side compares roots and picks a winner **deterministically** — lexicographically smaller, so a replay reproduces the same result — then the losing root's members are told to re-point and the member sets are unioned.
+
+Attaching the smaller cluster to the larger matters materially here: it bounds how many re-point messages each merge produces. And because the DataStream API doesn't support cyclic dataflow, those merge messages travel through a feedback loop via Kafka rather than an in-job iteration.
+
 ### Stage 2 — Bot Scoring (runs on time windows)
 
 Scoring needs behaviour over a period, not a single click, so this stage accumulates events per identity over a window, then computes:

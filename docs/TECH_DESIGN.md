@@ -215,7 +215,18 @@ We publish one thing: a stream of identities that look automated, with the ident
 - **Retroactive (attribution, analytics).** These reconcile hours or days later anyway, so lag is irrelevant. They take the flagged `member_ids` and exclude matching events from their own data.
 - **Forward-looking (fraud alerting, rate limiting).** These can't un-serve the request that triggered the score, and don't need to — they act on the *next* requests from those identifiers.
 
-**Why `member_ids` is on the record.** Without it, every consumer would have to maintain a stateful join back to raw clickstream to work out which events belonged to a flagged identity — the same cost paid four times, with four chances to get it wrong. Shipping the identifier set makes the stream self-contained: a consumer joins a small set of flagged IDs against its own data, which is cheap, instead of joining against the firehose.
+**Yes, consumers join — and that's the intended design.** A consumer builds a set of flagged identifiers from `member_ids` and filters its own data against it:
+
+```sql
+SELECT * FROM paid_clicks
+WHERE browser_id NOT IN (SELECT identifier FROM flagged_identifiers_today)
+```
+
+A streaming consumer does the same with the flagged set held in broadcast state.
+
+**Why we don't instead enrich the clickstream.** The alternative is attaching a score to every event and republishing all of it, so nobody joins. We rejected it: that means republishing the full firehose with one extra column, roughly doubling storage and throughput, and it puts this job on the critical path for traffic that has nothing to do with bots — if it stalls, consumers stop receiving events entirely.
+
+Signal-only works because **the flagged set is tiny**. Out of a day's events, only identities scoring above the floor are published, so a consumer holds perhaps tens of thousands of identifiers in memory. That's a broadcast lookup, not the expensive stream-to-stream shuffle the word "join" usually implies — and `member_ids` is on the record precisely so that lookup needs nothing else from us.
 
 ## Measuring Success
 

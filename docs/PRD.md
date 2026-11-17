@@ -14,7 +14,6 @@ Everything here is spelled out in full in the document too — this table is jus
 | **Browser ID** | A long-lived identifier stored in a browser cookie, typically lasting years. Scoped to **one browser**, not to a person or a machine — the same laptop running two browsers produces two browser IDs. Despite often being labelled a "device" ID in clickstream schemas, it is not hardware-based. |
 | **App device ID** | An operating-system-level device identifier available only in **app traffic** (and app webviews). Unlike a browser ID, it involves no cookies at all, so clearing browser data doesn't touch it. |
 | **Account ID** | The identifier for a signed-in user. Only present after login, which is often late in a session or never. |
-| Session ID / Visit ID | Short-lived groupings of one browser's activity — a visit typically ends after ~30 minutes of inactivity. Useful for measuring behaviour, **not** for linking identities. |
 | IP address | The network address a device connects from. Many real people share one (a whole office), and people can hide theirs behind a virtual private network. |
 | Identity cluster | Our best guess at "all the identifiers belonging to the same visitor," grouped together. |
 | Bot | Automated software pretending to be a person. |
@@ -82,8 +81,6 @@ The linking evidence we actually act on:
 | Browser ID ↔ account ID | Web, at login | The only way to connect two separate browsers to one person |
 | App device ID ↔ account ID | App, at login | Connects app activity to the person |
 | App device ID ↔ browser ID | App webviews, where both are on one event | Bridges someone's app identity and their web identity |
-
-Session and visit identifiers are deliberately **not** linking inputs — they subdivide a single browser's activity rather than connecting different identifiers, so feeding them to union-find would add noise and no information.
 
 **Score each identity for bot-likelihood** using four signals:
 

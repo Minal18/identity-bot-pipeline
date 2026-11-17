@@ -29,7 +29,6 @@ This drives every design decision downstream, so it comes first.
 | **Browser ID** | A long-lived cookie, typically years, often stored redundantly across paired cookies so a partial clear regenerates it | One browser | Only partially — a deliberate full clear resets it |
 | **App device ID** | Operating-system device identifier, no cookies involved | One device, **app traffic only** | Yes, entirely unaffected |
 | **Account ID** | Login | One person | Yes |
-| Session / visit ID | Short-lived cookie or inactivity window | A slice of one browser's activity | No |
 
 **The critical point: on web there is no hardware identifier.** Clickstream schemas commonly label the long-lived browser cookie a "device ID," but it identifies a browser, not a machine. Two browsers on one laptop yield two of them. This means on web, "browser ID" and "device ID" are *one signal, not two* — and treating them as independent corroboration would be double-counting.
 
@@ -43,9 +42,7 @@ This drives every design decision downstream, so it comes first.
 | App device ID ↔ account ID | App login | Joins app activity to the person |
 | **App device ID ↔ browser ID** | **App webview — both on one event** | Bridges app and web identity. The highest-value edge we get. |
 
-**Session and visit IDs are excluded from union-find on purpose.** They subdivide one browser's activity rather than connecting distinct identifiers, so they'd add state and noise without adding linking evidence. They're used instead as denominators for the timing signal.
-
-**IP address is deliberately not a merge key either** — see Example C.
+**IP address is deliberately not a merge key** — see Example C.
 
 ## Architecture
 

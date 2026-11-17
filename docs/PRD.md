@@ -96,7 +96,7 @@ Session and visit identifiers are deliberately **not** linking inputs — they s
 
 **Survive failures without corrupting output.** Exactly-once processing, meaning each event affects the output exactly one time even if a machine crashes mid-stream — no duplicates, nothing lost. State lives in RocksDB (an on-disk store, so the identity graph can exceed available memory), and unused entries expire automatically so it doesn't grow forever.
 
-**Publish results to Kafka** in two forms: an enriched event stream, and a compacted per-identity verdict table. (Details in the tech design — the two shapes exist because some consumers filter traffic as it flows and others look up a verdict after the fact.)
+**Publish a bot signal stream to Kafka.** One record per identity per scoring window, carrying the score, the individual signals behind it, and the identifiers that make up that identity. Consumers decide what to do with it — we publish the signal and nothing else.
 
 ## Out of Scope — v1 (future consideration)
 

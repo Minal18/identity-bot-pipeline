@@ -2,7 +2,7 @@
 
 ## The One-Paragraph Version
 
-A Flink job reads clickstream events from Kafka. Stage one groups identifiers that appear together into a single identity. Stage two looks at each identity over a time window and scores how bot-like it behaves. Results go back to Kafka in two shapes — an enriched event stream and a per-identity verdict table — for other teams to consume. The whole thing is built so that if a machine dies mid-stream, nothing is lost or double-counted.
+A Flink job reads clickstream events from Kafka. Stage one groups identifiers that appear together into a single identity. Stage two looks at each identity over a time window and scores how bot-like it behaves. Identities that look automated are published back to Kafka as a bot signal stream for other teams to consume. The whole thing is built so that if a machine dies mid-stream, nothing is lost or double-counted.
 
 > Design decisions below (partitioning, field names, window sizes) are written to be confirmed against the running job — flag anything that doesn't match what was actually built.
 
@@ -21,7 +21,6 @@ A Flink job reads clickstream events from Kafka. Stage one groups identifiers th
 | Event time | Ordering by when something happened, not when it reached us. |
 | Watermark | A marker flowing through the stream meaning "we believe we've seen everything up to time T." It tells the job when a window is complete and safe to emit. |
 | Union-find | An algorithm for merging groups. Each group has one member designated its representative; merging points one representative at the other. Asking "are these two in the same group?" means following pointers up to each one's representative. |
-| Compacted topic | A Kafka topic that keeps only the most recent record per key — effectively a lookup table, not a history. |
 
 ## The Identifiers We Work With
 
@@ -60,12 +59,11 @@ flowchart TD
     D -- "fan-out · shared IP · ID churn · timing" --> D
     B -. "periodic snapshot" .-> E[("Checkpoints<br/>for exactly-once recovery")]
     D -. "periodic snapshot" .-> E
-    D --> F["Enriched Event Stream<br/>(full event + identity + score)"]
-    D --> G["Verdict Table<br/>(compacted, keyed by identity / IP)"]
+    D --> F["Bot Signal Stream<br/>(Kafka output topic)<br/>identity + score + signals + member IDs"]
     F --> H["Attribution Pipeline"]
-    F --> I["Analytics & Reporting"]
-    G --> J["Fraud / Trust & Safety"]
-    G --> K["Rate Limiter (future)"]
+    F --> I["Fraud / Trust & Safety"]
+    F --> J["Analytics & Reporting"]
+    F --> K["Rate Limiter (future)"]
 ```
 
 ## How It Works, Step by Step
@@ -139,8 +137,7 @@ Two colleagues on one corporate network share an IP but never share a browser, d
 | **Automatic expiration** | Links not seen again within a set window are dropped, so one-off and dormant visitors don't accumulate forever |
 | **Bot Scoring operator** | Computes the four signals over event-time windows and combines them |
 | **Checkpointing** | Snapshots all state periodically; combined with Kafka transactional writes, this is what makes exactly-once hold through a crash |
-| **Enriched event stream** | Full original event plus identity and score — so consumers never need to join back to raw clickstream |
-| **Verdict table** | Compacted topics keyed by identity and by IP address, holding only the current verdict — the lookup path |
+| **Bot signal stream** | One record per identity per scoring window — score, signal breakdown, and the member identifiers — published for any team to consume |
 
 ## Data Model
 
@@ -150,7 +147,7 @@ Two colleagues on one corporate network share an IP but never share a browser, d
 |---|---|---|
 | Identity group state | Flink keyed state (RocksDB) | **Internal only.** Never leaves the job. Exists so the next event can be merged. Freely changeable. |
 | Bot scoring window state | Flink window state | **Internal only.** Scratch space for one window, discarded when it closes. |
-| Enriched event + verdict record | Kafka output topics | **The public contract.** The only things other teams ever see, and the only ones needing careful versioning. |
+| Bot signal record | Kafka output topic | **The public contract.** The only thing other teams ever see, and the only one needing careful versioning. |
 
 ### Identity group state (internal — one per identity)
 
@@ -180,34 +177,32 @@ A production-grade alternative is a **synthetic generated identity plus a publis
 | `inter_arrival_stats` | mean, standard deviation, minimum | Timing signal. Low standard deviation means mechanical spacing; a very low minimum means faster than a human can click |
 | `bot_score` | float | The four signals combined |
 
-### Enriched event record (public)
-
-The full original event, plus:
+### Bot signal record (public — one per identity, per scoring window)
 
 | Field | Type | Notes |
 |---|---|---|
 | `identity_id` | string | The group representative **at emission time** — may change later if the group merges again |
+| `member_ids` | set of strings | The browser, app device, and account identifiers in this identity. **This is what makes the stream usable without a heavy join** — consumers filter their own data against this set |
+| `ip_addresses` | set of strings | Addresses this identity was seen on during the window |
 | `bot_score` | float | 0–1 likelihood, not a yes/no verdict |
-| `signal_breakdown` | fan-out, shared IP, churn, timing | The individual values, so consumers apply their own thresholds |
+| `signal_breakdown` | fan-out, shared IP, churn, timing | The individual values, so consumers apply their own thresholds rather than trusting our blend |
+| `window_start` / `window_end` | timestamp | The period this score describes |
 | `watermark_at_emission` | timestamp | Tells a consumer how much late data could still revise this |
 
-### Verdict record (public, compacted — keyed by `identity_id`, and separately by IP address)
+**One record per identity per window, not per event.** Scoring is windowed, so per-event output would mean repeating the same score across every event in the window. Per-identity-per-window output is far smaller and loses nothing.
 
-| Field | Type | Notes |
-|---|---|---|
-| `bot_score` | float | Current score for this identity or address |
-| `signal_breakdown` | struct | As above |
-| `updated_at` | timestamp | When this verdict was last revised |
+**Emit above a low floor, not everything.** Publishing a record for every identity would mean publishing mostly uninteresting traffic. Emitting only identities scoring above a low threshold keeps volume proportional to suspicious activity rather than total traffic. The floor should sit *below* any threshold a consumer would actually act on, so teams can still choose to be more cautious than us — it exists to drop the obviously-fine, not to make the decision for anyone.
 
 ## How Downstream Teams Actually Consume This
 
-**The timing reality first:** the bot score necessarily lags the event, because scoring needs a window to close. **No consumer can synchronously filter the event that produced the signal.** You either filter *subsequent* traffic or filter *retroactively*. There is no third option — and that's fine, because it maps cleanly onto the two consumer shapes:
+We publish one thing: a stream of identities that look automated, with the identifiers belonging to each. What any team does with it is theirs to decide.
 
-**Shape 1 — retroactive (attribution, analytics).** These reconcile hours or days later anyway, so lag is irrelevant. They read the **enriched event stream** and filter on `bot_score`, or land it in the warehouse and filter there. No join required, because the enriched stream already carries the full event.
+**The timing reality matters, though:** the score necessarily lags the event, because scoring needs a window to close. **No consumer can synchronously filter the event that produced the signal.** You either filter *subsequent* traffic or filter *retroactively*. There is no third option — and that's fine, because it covers both real use cases:
 
-**Shape 2 — forward-looking (fraud alerting, rate limiting).** These can't un-serve the request that triggered the score, and don't need to — they need to act on the *next* requests from that identity or address. They read the **compacted verdict table** as a lookup: "is this identity currently flagged?"
+- **Retroactive (attribution, analytics).** These reconcile hours or days later anyway, so lag is irrelevant. They take the flagged `member_ids` and exclude matching events from their own data.
+- **Forward-looking (fraud alerting, rate limiting).** These can't un-serve the request that triggered the score, and don't need to — they act on the *next* requests from those identifiers.
 
-**Why not have consumers join against the raw stream?** Because publishing only an event reference would force **every** consumer to maintain a stateful join back to raw clickstream to recover what the event was — four teams each paying the same cost, four chances to get it wrong. Emitting the enriched event once moves that cost into this job, where it's paid a single time.
+**Why `member_ids` is on the record.** Without it, every consumer would have to maintain a stateful join back to raw clickstream to work out which events belonged to a flagged identity — the same cost paid four times, with four chances to get it wrong. Shipping the identifier set makes the stream self-contained: a consumer joins a small set of flagged IDs against its own data, which is cheap, instead of joining against the firehose.
 
 ## How Failure Is Handled
 

@@ -224,9 +224,28 @@ WHERE browser_id NOT IN (SELECT identifier FROM flagged_identifiers_today)
 
 A streaming consumer does the same with the flagged set held in broadcast state.
 
-**Why we don't instead enrich the clickstream.** The alternative is attaching a score to every event and republishing all of it, so nobody joins. We rejected it: that means republishing the full firehose with one extra column, roughly doubling storage and throughput, and it puts this job on the critical path for traffic that has nothing to do with bots — if it stalls, consumers stop receiving events entirely.
+**Nobody should write that join twice.** It's published once as a warehouse view, and consumers select from it:
 
-Signal-only works because **the flagged set is tiny**. Out of a day's events, only identities scoring above the floor are published, so a consumer holds perhaps tens of thousands of identifiers in memory. That's a broadcast lookup, not the expensive stream-to-stream shuffle the word "join" usually implies — and `member_ids` is on the record precisely so that lookup needs nothing else from us.
+```sql
+CREATE VIEW clickstream_scored AS
+SELECT c.*, COALESCE(s.bot_score, 0) AS bot_score
+FROM clickstream c
+LEFT JOIN flagged_identifiers s ON c.browser_id = s.identifier
+```
+
+Attribution then writes `WHERE bot_score < 0.8` and nothing more — the same ergonomics as a pre-enriched stream, with the join semantics defined in one place rather than in four pipelines.
+
+### Why we don't republish the clickstream enriched
+
+The alternative considered was attaching a score to every event and republishing the whole stream, so no consumer ever joins. It was rejected for two reasons.
+
+**The score doesn't exist when the event passes through.** Scoring is windowed, so an event arriving at 10:00:03 has no score for the 10:00–10:05 window yet. Attaching whatever score exists at pass-through time would leave brand-new identities unscored — and a brand-new identity is precisely the bot case we care about. Getting correct scores onto events requires buffering each event until its window closes, which makes the enriched stream lag by a full window.
+
+**The consumers don't need it.** Attribution and analytics are batch and join cheaply in the warehouse. Fraud alerting wants to know which *identities* are bad, not to receive every event with a flag attached. The rate limiter is future scope and acts on subsequent requests regardless. So enrichment would mean roughly doubling clickstream storage and throughput, and putting this job on the critical path for traffic unrelated to bots, to remove a burden that is close to zero for everyone actually consuming it.
+
+Signal-only works because **the flagged set is tiny** — only identities above the emit floor are published, so a streaming consumer holds perhaps tens of thousands of identifiers in memory. That's a broadcast lookup, not the stream-to-stream shuffle the word "join" usually implies, and `member_ids` is on the record precisely so that lookup needs nothing else from us.
+
+**This decision is reversible.** If a genuine real-time, per-event consumer appears, enrichment becomes worth revisiting — the trade-off then is window-length latency against join-free consumption.
 
 ## Measuring Success
 

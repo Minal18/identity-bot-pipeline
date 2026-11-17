@@ -89,11 +89,13 @@ The linking evidence we actually act on:
 - **New-identifier churn per IP address** — how many brand-new browser IDs first appear from one address per minute. Real traffic mints these slowly; a bot clearing cookies between requests mints hundreds. **This is the signal that compensates when fan-out collapses**, and it's the main defence against cookie-rotating scrapers.
 - **Click timing** — gaps between consecutive events that are too fast to be human, or too evenly spaced. People are irregular; scripts are not.
 
-**Handle out-of-order events.** Signals don't arrive in the order they happened — account ID in particular usually appears at checkout, long after the browsing events from the same session. We process on *event time* (when it actually happened) rather than arrival time, using watermarks: a marker meaning "we believe we've now seen everything up to this point," which tells us when a result is safe to finalize.
+**Handle out-of-order events.** Signals don't arrive in the order they happened — account ID in particular usually appears at checkout, long after the browsing events from the same session. We track activity by *event time* (when it actually happened) rather than arrival time, using watermarks: a marker meaning "we believe we've now seen everything up to this point," which tells us when old activity can safely be aged out of memory.
 
 **Survive failures without corrupting output.** Exactly-once processing, meaning each event affects the output exactly one time even if a machine crashes mid-stream — no duplicates, nothing lost. State lives in RocksDB (an on-disk store, so the identity graph can exceed available memory), and unused entries expire automatically so it doesn't grow forever.
 
-**Publish a bot signal stream to Kafka.** One record per identity per scoring window, carrying the score, the individual signals behind it, and the identifiers that make up that identity. Consumers decide what to do with it — we publish the signal and nothing else.
+**Publish a classification change stream.** We hold a current bot-or-human verdict for each identity and emit a record only when that verdict is **first set or changes** — not one per event, and not one per time window. A busy identity that stays classified the same way produces nothing.
+
+This keeps the output small enough that a consumer can hold the current verdict for every known identity in memory, and it's what allows bot traffic to be filtered centrally in the clickstream pipeline so most downstream teams never see it in the first place.
 
 ## Out of Scope — v1 (future consideration)
 

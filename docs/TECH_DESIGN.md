@@ -69,17 +69,23 @@ An event may carry a browser ID, sometimes an app device ID, sometimes an accoun
 
 Merging is permanent and incremental — we never recompute the graph, we absorb evidence as it arrives. That's what makes it real-time.
 
-#### Why union-find is built here rather than taken from a library
+#### What union-find buys us
 
-The algorithm itself is about fifteen lines. No library helps, because every library version holds the whole structure in one process's memory and reads any part of it on demand — and neither of those holds here.
+It connects identifiers that were **never seen together**.
 
-The groups are **split across workers**, and a worker can only read the one key it is currently handling. It cannot follow a pointer into a group living on another machine. And anything kept in plain memory is **gone when a worker restarts**, taking the identity graph with it — a library version would pass a single-node test and then lose everything on the first recovery.
+| Day | Seen on one event | What it tells us |
+|---|---|---|
+| Monday | laptop browser, alone | nothing yet |
+| Tuesday | phone browser **+ account** | same person |
+| Wednesday | laptop browser **+ account** | same person |
 
-So each identifier keeps its own small piece of state: who it points at, the member list if it happens to be its group's representative, and when it was last seen.
+The laptop and the phone never appear on the same event — but both appear with the account, so all three are one traveler. Union-find is what chains that together automatically as each new pair arrives, rather than us rebuilding the picture from scratch.
 
-Merging two identifiers on different workers is therefore a **message, not a function call**. One side sends its representative to the other; the receiving side picks the winner — always the lexicographically smaller, so a replay produces the same answer — and the losing group's members are told to re-point. Attaching the smaller group to the larger keeps the number of those re-point messages down.
+Its two operations are its name: **union** merges two groups once we learn they're the same person, and **find** answers which group an identifier currently belongs to.
 
-Because the DataStream API can't loop back on itself, merge messages travel out to a Kafka topic and back in.
+Each identifier stores only who it points at, plus the member list if it happens to be its group's representative. When two groups merge, the smaller one points at the larger, and the winner is chosen by a fixed rule (lexicographically smaller identifier) so that a replay after a crash reproduces exactly the same identities.
+
+It is written directly against Flink state rather than taken from a library, because library implementations keep the whole structure in ordinary memory — which Flink would not include in checkpoints, so the entire identity graph would vanish on the first restart.
 
 ### Stage 2 — Bot Scoring (runs on time windows)
 

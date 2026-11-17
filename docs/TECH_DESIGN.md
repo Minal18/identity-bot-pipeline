@@ -69,27 +69,17 @@ An event may carry a browser ID, sometimes an app device ID, sometimes an accoun
 
 Merging is permanent and incremental — we never recompute the graph, we absorb evidence as it arrives. That's what makes it real-time.
 
-#### Why union-find is implemented here rather than taken from a library
+#### Why union-find is built here rather than taken from a library
 
-Textbook union-find assumes one process, one in-memory parent array, and random access to any element. All three are false in a partitioned streaming job:
+The algorithm itself is about fifteen lines. No library helps, because every library version holds the whole structure in one process's memory and reads any part of it on demand — and neither of those holds here.
 
-| Textbook assumption | Reality here |
-|---|---|
-| Global access to the parent map | A keyed function can read only **its own key's** state — there is no way to call `find(x)` from inside key `y` |
-| An in-memory object graph | State must live in Flink managed state to be checkpointed; a plain in-memory structure is lost on restart |
-| Path compression rewrites many entries per lookup | Writing to another key's state isn't possible, so classic path compression can't be performed |
+The groups are **split across workers**, and a worker can only read the one key it is currently handling. It cannot follow a pointer into a group living on another machine. And anything kept in plain memory is **gone when a worker restarts**, taking the identity graph with it — a library version would pass a single-node test and then lose everything on the first recovery.
 
-A library implementation would appear to work in a single-node test and then lose the entire identity graph on the first recovery. So the structure is implemented directly against keyed state:
+So each identifier keeps its own small piece of state: who it points at, the member list if it happens to be its group's representative, and when it was last seen.
 
-```java
-ValueState<String>        root;      // the identifier I currently point at
-MapState<String, Boolean> members;   // populated only when I am the root
-ValueState<Long>          lastSeen;  // drives expiry
-```
+Merging two identifiers on different workers is therefore a **message, not a function call**. One side sends its representative to the other; the receiving side picks the winner — always the lexicographically smaller, so a replay produces the same answer — and the losing group's members are told to re-point. Attaching the smaller group to the larger keeps the number of those re-point messages down.
 
-Keyed by identifier, merging becomes message passing rather than a function call. An event carrying two identifiers fans out into link requests; one side reads its root and sends a merge message toward the other; the receiving side compares roots and picks a winner **deterministically** — lexicographically smaller, so a replay reproduces the same result — then the losing root's members are told to re-point and the member sets are unioned.
-
-Attaching the smaller cluster to the larger matters materially here: it bounds how many re-point messages each merge produces. And because the DataStream API doesn't support cyclic dataflow, those merge messages travel through a feedback loop via Kafka rather than an in-job iteration.
+Because the DataStream API can't loop back on itself, merge messages travel out to a Kafka topic and back in.
 
 ### Stage 2 — Bot Scoring (runs on time windows)
 

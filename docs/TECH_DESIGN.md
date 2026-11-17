@@ -4,8 +4,6 @@
 
 A Flink job reads clickstream events from Kafka. Stage one groups identifiers that appear together into a single identity. Stage two looks at each identity over a time window and scores how bot-like it behaves. Identities that look automated are published back to Kafka as a bot signal stream for other teams to consume. The whole thing is built so that if a machine dies mid-stream, nothing is lost or double-counted.
 
-> Design decisions below (partitioning, field names, window sizes) are written to be confirmed against the running job — flag anything that doesn't match what was actually built.
-
 ## Key Terms
 
 | Term | What it means |
@@ -275,7 +273,7 @@ Both assertions must pass. A duplicate means the Kafka sink isn't transactional;
 
 - **Fan-out is weak on web, by construction.** Because the durable web identifier is itself cookie-backed, a bot clearing browser data between requests never merges into a cluster, and fan-out reads as normal (Example B). The shared-IP and churn-per-IP signals exist specifically to cover this. Worth stating plainly rather than letting fan-out appear to do more work than it can.
 
-- **Merging across partitions is the hard part.** Flink splits state across workers by key. If browser IDs and account IDs route to different workers, discovering that two *already-existing* groups on *different workers* should merge isn't something one worker can do alone — it needs either a broadcast of recent state or an explicit merge message routed to both. Worth confirming how the running job handles this: if groups can silently exist in two places, every fan-out count is wrong.
+- **Merges across workers resolve asynchronously.** Flink partitions state by key, so each identifier's group membership lives on exactly one worker. When an event links two identifiers that hash to different workers, no single worker can perform the merge alone — the job emits an explicit merge message to each side and the groups converge over one or more hops. The consequence is that merging is eventually consistent: for a brief period after the linking event, one logical identity can still appear as two separate groups, which slightly understates fan-out during that window. Acceptable because fan-out is measured over windows much longer than convergence takes, but it's the reason fan-out is a scoring input rather than a hard rule.
 
 - **The identity ID isn't stable forever.** We emit the representative as it stands. Later evidence can merge that group into a larger one — a returning visitor's browser finally linking to their account at checkout, long after earlier events were scored under a different ID. Consumers needing a stable key over time (attribution reconciliation especially) need either the alias table described above or a remap step.
 

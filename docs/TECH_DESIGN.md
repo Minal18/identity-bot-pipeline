@@ -1,100 +1,123 @@
 # Real-Time Identity Resolution & Bot Detection — Architecture & Data Model
 
-## Key Terms
+## The One-Paragraph Version
 
-Terms below are spelled out in full everywhere they're used in this document — this table is just a quick reference.
+A Flink job reads clickstream events from Kafka. The first stage groups device, cookie, and account IDs that appear together into one identity. The second stage looks at each identity over a time window and scores how bot-like it behaves. The result goes back out to Kafka for other teams. The whole thing is built so that if a machine dies mid-stream, we don't lose or double-count anything.
+
+> The design choices below (how we partition the data, exact field names, window sizes) are written as decisions to confirm against the running job — flag anything that doesn't match what was actually built.
+
+## Key Terms
 
 | Term | What it means |
 |---|---|
-| IP address | The network address a device connects from |
-| Java Virtual Machine heap | The in-memory space Flink's own process runs in — a limited resource, separate from RocksDB's on-disk state |
-| Time-based expiration | Automatically discarding a stored entry once it's gone unused for a set amount of time, so storage doesn't grow forever |
-| Business-intelligence reporting | Analytics/dashboard tooling used to visualize data for business decisions |
-
-Stateful Flink job over Kafka that links device/cookie/account signals into unified identities via incremental union-find, then scores each identity cluster for bot-likelihood using event-time windowed signals. Built for exactly-once correctness under failure (RocksDB state, checkpointing), with state that automatically expires so the identity graph doesn't grow unbounded.
-
-> Design assumptions below (keying strategy, exact schemas, window sizes) are documented as implementation decisions to confirm against the actual job — flag anything that doesn't match what was actually built.
+| Flink | The stream processing engine this job runs on. Processes events one at a time as they arrive, rather than in nightly batches. |
+| Kafka | The message queue events flow through — one topic in, one topic out. |
+| Operator | One processing step inside the Flink job. Our job has two main ones: identity resolution, then bot scoring. |
+| Keyed state | Memory the job keeps per key — here, per identity. When an event for identity X arrives, Flink gives the operator exactly X's stored data to read and update. |
+| RocksDB | An on-disk key-value store Flink can use to hold that state, so it can be larger than available memory. |
+| TaskManager | A Flink worker process. A job runs across several; killing one is how we test failure recovery. |
+| Checkpoint | A periodic saved snapshot of everything the job has in state. On a crash, the job restarts from the last one. |
+| Exactly-once | The guarantee that each input event affects the output exactly one time, even across a crash and restart. Not "at least once" (duplicates) and not "at most once" (data loss). |
+| Event time | Ordering by when something actually happened, not when it reached us. |
+| Watermark | A marker flowing through the stream meaning "we believe we've now seen all events up to time T." It's how the job decides a time window is complete and safe to emit. |
+| Union-find | An algorithm for merging groups. Each group has one member designated as its representative; merging two groups means pointing one representative at the other. Checking "are these two IDs in the same group?" means following the pointers up to the representative for each. |
+| Fan-out | How many distinct IDs have merged into one identity. The core bot signal — a bot farm accumulates far more than a real person. |
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    A["Clickstream Events<br/>(Kafka source topic)<br/>device_id, cookie_id, account_id, ip, ts"] --> B["Identity Resolution Operator<br/>(incremental union-find, keyed state)"]
-    B -- "read/write identity graph" --> C[("Keyed State<br/>RocksDB backend, entries auto-expire")]
-    B --> D["Bot Scoring Operator<br/>(event-time windows + watermarks)"]
-    D -- "fan-out, shared-IP, click-timing" --> D
-    B -. "checkpoint barrier" .-> E[("Checkpoint Store<br/>exactly-once, periodic snapshot")]
-    D -. "checkpoint barrier" .-> E
-    D --> F["Kafka Output Topic<br/>unified_identity_id + bot_score + signal breakdown"]
+    A["Clickstream Events<br/>(Kafka input topic)<br/>device_id, cookie_id, account_id, ip, timestamp"] --> B["Stage 1: Identity Resolution<br/>(union-find over keyed state)"]
+    B -- "read/update identity groups" --> C[("Keyed State<br/>RocksDB, entries auto-expire")]
+    B --> D["Stage 2: Bot Scoring<br/>(time windows, ordered by event time)"]
+    D -- "fan-out · shared IP · click timing" --> D
+    B -. "periodic snapshot" .-> E[("Checkpoints<br/>for exactly-once recovery")]
+    D -. "periodic snapshot" .-> E
+    D --> F["Kafka Output Topic<br/>identity_id + bot_score + reasons"]
     F --> G["Attribution Pipeline"]
-    F --> H["Trust & Safety Alerting"]
-    F --> I["Search/Pricing Rate Limiter (future)"]
-    F --> J["Analytics / Business Intelligence"]
+    F --> H["Fraud / Trust & Safety Alerts"]
+    F --> I["Search & Pricing Rate Limiter (future)"]
+    F --> J["Analytics & Reporting"]
 ```
 
-## Processing Stages
+## How It Works, Step by Step
 
-| Stage | Fires on | Action |
-|---|---|---|
-| **Identity Resolution** | Every clickstream event | Looks up/updates union-find state for the event's device_id, cookie_id, account_id; merges clusters when two previously-separate IDs co-occur on the same event; emits the event tagged with its current `unified_identity_id` |
-| **Bot Scoring** | Windowed, per `unified_identity_id` and per `ip`, event-time with watermarks | Computes fan-out count (distinct device/cookie IDs merged into the cluster within the window), shared-IP-address concentration (distinct identities seen on the same IP address within the window), and click-timing regularity (inter-arrival time stats); combines into a bot_score |
+**Stage 1 — Identity Resolution.** Runs on every single event.
 
-**How the workflow runs**: every event first passes through identity resolution, which may merge its IDs into an existing cluster or create a new one — this always happens before scoring, since bot scoring operates on clusters, not raw IDs. Bot scoring then runs as a windowed aggregation keyed by the resolved identity (and separately by IP address, to catch shared-IP-address fan-out even across identities that haven't been merged). Watermarks account for signals that can arrive out of order across the three underlying sources (e.g. account_id is often only revealed at checkout, well after the device/cookie signals for the same session).
+An event might carry a device ID, a cookie ID, and sometimes an account ID. The fact that they arrived on the *same event* is the evidence that they belong to the same person. So the operator looks up what group each of those IDs currently belongs to, and if they're in different groups, it merges them into one. Then it tags the event with the identity it now belongs to and passes it along.
+
+The merging is permanent and incremental — we never recompute the whole graph, we just keep absorbing new evidence as it arrives. That's what makes it work in real time.
+
+**Stage 2 — Bot Scoring.** Runs on time windows, not individual events.
+
+Scoring needs to look at behavior over a period, not one click, so this stage collects events per identity over a window and then computes three things:
+
+- **Fan-out** — how many new device and cookie IDs joined this identity during the window. A real traveler adds devices rarely. A bot farm adds them constantly.
+- **Shared IP address** — how many *separate* identities were seen on the same IP address. Note this one is computed per IP address rather than per identity, then attached back to each identity that used that address. That's deliberate: it catches bot farms whose fake identities haven't been merged together yet, because they were careful not to let their IDs co-occur on a single event.
+- **Click timing** — the gaps between consecutive events. Humans are irregular; they pause, they get distracted. Scripts produce intervals that are either too fast to be physically possible or suspiciously evenly spaced.
+
+These combine into one score, published along with the individual signal values so each consuming team can set its own threshold instead of trusting our blended number.
+
+**Why event time and watermarks matter here.** The three signals don't arrive together or in order. Account ID in particular usually shows up at checkout — long after the device and cookie events from the same session. If we scored by arrival time, we'd finalize a window before the evidence that changes the answer had arrived. Processing by event time with watermarks lets the job wait an appropriate amount before declaring a window complete.
 
 ## Components
 
-| Component | Responsibility |
+| Component | What it does |
 |---|---|
-| **Kafka Input Topic** | Raw clickstream events: device_id, cookie_id, account_id (nullable until login/checkout), ip, event_type, event_time |
-| **Identity Resolution Operator** | Incremental union-find over keyed state — merges device/cookie/account IDs that co-occur on the same event into one cluster; assigns/propagates `unified_identity_id` |
-| **Keyed State (RocksDB)** | Backs the union-find parent map per identity cluster; RocksDB chosen over heap state because the identity graph is expected to exceed what fits comfortably in the Java Virtual Machine heap at production event volume |
-| **Automatic expiration** | Bounds identity graph growth — a device/cookie/account edge not reinforced within a set amount of time expires, so long-idle or one-off visitors don't accumulate in state forever |
-| **Bot Scoring Operator** | Event-time windowed aggregation computing fan-out, shared-IP concentration, and click-timing regularity per cluster; combines into a single bot_score with a signal breakdown |
-| **Checkpointing** | Periodic exactly-once snapshot of all keyed state (RocksDB incremental checkpoints) plus Kafka transactional output, so a TaskManager failure replays from the last checkpoint without duplicating or dropping output |
-| **Kafka Output Topic** | One row per event (or per window close): `unified_identity_id`, `bot_score`, signal breakdown, and the original event's correlation fields |
-| **Downstream consumers** | Attribution pipeline (exclude/flag bot-attributed conversions), trust & safety (alert on high fan-out clusters), search/pricing platform (capacity/rate-limit input, future), analytics and business-intelligence reporting |
+| **Kafka input topic** | Raw clickstream events: device ID, cookie ID, account ID (empty until someone logs in), IP address, event type, and when it happened |
+| **Identity Resolution operator** | Merges IDs that appear together into one identity; tags each event with its current identity |
+| **Keyed state (RocksDB)** | Holds the identity groups. RocksDB rather than memory because at production traffic the graph is bigger than the job's available memory |
+| **Automatic expiration** | Any link not seen again within a set time window is dropped, so one-off and long-dormant visitors don't pile up forever |
+| **Bot Scoring operator** | Computes the three signals over time windows and combines them into a score |
+| **Checkpointing** | Periodically snapshots all state; combined with Kafka's transactional writes, this is what makes the exactly-once guarantee hold through a crash |
+| **Kafka output topic** | Identity ID, bot score, the individual signal values, and the original event's reference fields |
+| **Downstream consumers** | Attribution (drop or flag bot clicks), fraud team (alerts), platform team (rate limiting, future), analytics and reporting |
 
 ## Data Model
 
-### Identity Graph State (keyed, per cluster)
+### Identity group state (one per identity)
 
 | Field | Type | Notes |
 |---|---|---|
-| `cluster_root_id` | string | Union-find root/representative ID for the cluster |
-| `member_ids` | set\<string\> | All device_id/cookie_id/account_id values merged into this cluster |
-| `last_seen_at` | timestamp | Drives when this entry expires — refreshed on every event that touches this cluster |
-| `first_seen_at` | timestamp | Used for fan-out-within-window calculations |
+| `cluster_root_id` | string | The ID chosen to represent this group — how union-find identifies the group |
+| `member_ids` | set of strings | Every device, cookie, and account ID merged into this identity |
+| `last_seen_at` | timestamp | Refreshed on every event; this is what the expiration clock reads |
+| `first_seen_at` | timestamp | Used to measure how fast the identity grew |
 
-### Bot Scoring Window State (per `unified_identity_id`, per window)
-
-| Field | Type | Notes |
-|---|---|---|
-| `distinct_member_count_in_window` | int | Fan-out signal — how many new IDs merged into the cluster within the window |
-| `distinct_identities_per_ip` | int | Shared-IP-address signal — computed per IP address, not per identity, then joined back onto any identity touching that IP address |
-| `inter_arrival_stats` | struct (mean, stddev, min) | Click-timing signal — unusually low variance or sub-human intervals skew toward "likely bot" |
-| `bot_score` | float | Combined score from the three signals above |
-
-### Output Event
+### Bot scoring window state (one per identity, per window)
 
 | Field | Type | Notes |
 |---|---|---|
-| `event_id` | string | Original event's correlation ID |
-| `unified_identity_id` | string | Cluster root ID at time of emission — can change later if the cluster merges further (see Notes) |
-| `bot_score` | float | 0–1 likelihood, not a binary decision |
-| `signal_breakdown` | struct | Per-signal contribution (fan_out, shared_ip, timing_regularity), so downstream consumers can apply their own thresholds rather than trusting one blended number |
-| `watermark_at_emission` | timestamp | Lets consumers reason about how much late data could still change this score |
+| `distinct_member_count_in_window` | int | The fan-out signal — how many new IDs joined during this window |
+| `distinct_identities_per_ip` | int | The shared-IP-address signal — computed per address, then attached to each identity on it |
+| `inter_arrival_stats` | average, standard deviation, minimum | The click-timing signal. Low standard deviation means mechanically even spacing; a very low minimum means faster than a human could click |
+| `bot_score` | float | The three signals combined |
 
-## Fault Tolerance
+### Output record
 
-- **State backend**: RocksDB, enabling state larger than available heap and incremental checkpointing (only state deltas are checkpointed, not a full snapshot every time).
-- **Exactly-once**: Flink's checkpointing (consistent snapshot of all operator state) combined with Kafka's transactional/two-phase-commit sink — output is only visible to consumers once the checkpoint that produced it is confirmed complete.
-- **Automatically-expiring state**: identity graph entries expire without reinforcement, keeping state size proportional to active traffic rather than all-time traffic.
-- **Validated recovery**: chaos-tested by killing TaskManagers mid-stream and confirming the output topic has no duplicate and no missing records after recovery — i.e. the exactly-once guarantee holds under a real failure, not just in theory.
+| Field | Type | Notes |
+|---|---|---|
+| `event_id` | string | Links back to the original event |
+| `identity_id` | string | The identity as of right now — this can change later if the group merges again (see below) |
+| `bot_score` | float | A 0–1 likelihood, not a yes/no verdict |
+| `signal_breakdown` | fan-out, shared IP, timing | The individual values behind the score, so consumers can apply their own thresholds |
+| `watermark_at_emission` | timestamp | Tells a consumer how much late data could still arrive and change this score |
 
-## Notes / Future Work
+## How Failure Is Handled
 
-- **Cross-partition merges are the hard part of distributed union-find.** If `device_id`, `cookie_id`, and `account_id` route to different state partitions depending on which key the job partitions by, detecting that two *already-separate* clusters on different partitions should merge (e.g. an account_id later appears alongside a device_id that's already linked to a different cluster elsewhere) requires either broadcasting small/recent state, or an explicit merge-request message routed to both partitions. Confirm which approach the actual job uses — this materially affects correctness of the fan-out signal if clusters can silently exist in two places at once.
-- **`unified_identity_id` is not immutable.** A cluster can merge further after its ID has already been emitted downstream (e.g. a returning visitor's old cookie finally links to their account at checkout, well after earlier events were scored and emitted under a different cluster ID). Downstream consumers that need a stable key across time (e.g. attribution reconciliation) need a reconciliation/remap path, not just a point-in-time cluster ID.
-- **Expiration vs. returning-visitor identity.** A visitor who returns after their old entry has already expired is treated as a brand-new identity — this bounds state size but means long-gap returning visitors can spuriously look like a "new" cluster exhibiting fan-out, which is itself one of the bot signals. Worth validating that legitimate low-frequency visitors aren't getting swept into the fan-out signal purely from expiring and re-linking.
-- **Click-timing is a noisy signal in isolation.** Humans using autofill/saved payment or power users (travel agents) can also produce fast, regular intervals — this is why it's combined with fan-out and shared-IP-address concentration rather than used alone, but the combination weighting needs real-traffic tuning, not a fixed formula guessed up front.
-- **Late-arriving account_id.** Because account_id is often only revealed at login/checkout, a bot score may be emitted before that signal arrives and later look different once it does — watermark lag should be monitored, and consumers that act on bot_score (e.g. excluding attribution) should know how final a given score is at the time they consume it.
+- **State lives in RocksDB**, on disk, so the identity graph isn't limited by memory. Checkpoints are incremental — each one saves only what changed, not a full copy.
+- **Exactly-once comes from two things working together**: Flink's checkpoints (a consistent snapshot of all state at a moment in time) and Kafka's transactional writes (output stays invisible to consumers until the checkpoint that produced it is confirmed). Without the second half, a crash between writing output and saving the checkpoint would produce duplicates on replay.
+- **State stays bounded** because unused links expire, so storage tracks active traffic rather than all traffic ever seen.
+- **This was tested, not assumed.** We killed TaskManagers while data was flowing and confirmed the output topic had no duplicated and no missing records afterward — the guarantee holds under a real crash, not just on paper.
+
+## Known Trade-offs & Open Items
+
+- **Merging across partitions is the hard part.** Flink splits state across workers by key. If device IDs and account IDs get routed to different workers, then discovering that two *already-existing* groups on *different workers* should merge is not something one worker can do alone — it needs either a broadcast of recent state or an explicit merge message sent to both. Worth confirming how the running job handles this, because if groups can silently exist in two places, the fan-out count is wrong.
+
+- **The identity ID isn't stable forever.** We emit the identity as it stands at that moment. Later evidence can merge that group into a bigger one — for example, a returning visitor's old cookie finally links to their account at checkout, long after earlier events were already scored and published under a different ID. Any consumer that needs a stable key over time (attribution reconciliation especially) needs a way to remap old IDs, not just the one we gave them at the time.
+
+- **Expiration conflicts with genuinely infrequent visitors.** Someone who returns after their links have expired looks like a brand-new identity. That's fine for storage, but it means a legitimate once-a-year traveler reappears as a "new" identity rapidly picking up devices — which is the fan-out pattern we treat as a bot signal. Needs validating against real low-frequency users so expiration doesn't manufacture false positives.
+
+- **Click timing is weak on its own.** Someone with saved payment details and autofill clicks through fast and regularly. So does a travel agent doing this all day. That's exactly why it's one of three signals rather than a standalone rule — but how much weight each signal gets has to be tuned on real traffic, not guessed up front.
+
+- **Account ID usually arrives late.** Because it only appears at login or checkout, we may publish a score before the single most informative signal has arrived. Watermark lag needs monitoring, and consumers acting on a score should know how settled it is — the `watermark_at_emission` field exists for exactly that.
